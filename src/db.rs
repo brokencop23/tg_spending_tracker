@@ -31,14 +31,14 @@ impl From<SqliteRow> for StatCategory {
         StatCategory {
             category: Category::new(row.get("alias"), row.get("name")),
             n_items: row.get("n"),
-            amount: (row.get::<i64,_>("amount") / 100) as f64
+            amount: row.get::<i64,_>("amount") as f64 / 100.0
         }
     }
 }
 
 impl Display for StatCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "-> {}: n={}, amount={}", self.category.name, self.n_items, self.amount)
+        write!(f, "-> {}: n={}, amount={:.2}", self.category.name, self.n_items, self.amount)
     }
 }
 
@@ -60,6 +60,10 @@ impl Stat {
         self.items.iter().map(|i| i.amount).sum()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -68,11 +72,9 @@ impl Stat {
 impl Display for Stat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let cats = self.items.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
-        let report = format!("
-        {} \n
-        =======================
-        Items: {} \t Amount: {}
-        ", cats, self.n_items(), self.amount()
+        let report = format!(
+            "{} \n=======================\nItems: {} \t Amount: {}",
+            cats, self.n_items(), self.amount()
         );
         write!(f, "{}", report)
     }
@@ -162,11 +164,20 @@ impl DB {
         Ok(id)
     }
 
-    pub async fn create_cost(&self, category_id: i64, amount: f64) -> Result<i64, DBError> {
+    pub async fn create_cost(
+        &self,
+        category_id: i64,
+        amount: f64,
+        dt: Option<DateTime<Utc>>
+    ) -> Result<i64, DBError> {
+        let dt = match dt {
+            Some(dt) => dt.timestamp(),
+            None => Utc::now().timestamp()
+        };
         let id = sqlx::query(
             "INSERT INTO spendings (dt, category_id, amount_cent) VALUES (?, ?, ?) RETURNING id"
             )
-            .bind(Utc::now().timestamp())
+            .bind(dt)
             .bind(category_id)
             .bind((amount * 100.0).round() as i64)
             .fetch_one(&self.conn)
@@ -175,14 +186,38 @@ impl DB {
         Ok(id)
     }
 
-    async fn get_stat(
+    pub async fn remove_last_cost(&self, chat_id: ChatId) -> Result<Option<i64>, DBError> {
+        let row = sqlx::query("
+            SELECT s.id 
+            FROM spendings s
+            LEFT JOIN category c ON (s.category_id=c.id)
+            WHERE c.chat_id=? and is_deleted=0
+            ORDER BY s.id DESC LIMIT 1
+            ")
+            .bind(chat_id.0)
+            .fetch_optional(&self.conn)
+            .await?;
+        match row {
+            Some(row) => {
+                let id = row.get::<i64,_>("id");
+                sqlx::query("UPDATE spendings SET is_deleted=1 WHERE id=?")
+                    .bind(id)
+                    .execute(&self.conn)
+                    .await?;
+                Ok(Some(id))
+            },
+            None => Ok(None)
+        }
+    }
+
+    pub async fn get_stat(
         &self,
         chat_id: ChatId,
         date_from: Option<DateTime<Utc>>,
         date_to: Option<DateTime<Utc>>
     ) -> Result<Stat, DBError> {
 
-        let mut where_clause = "chat_id=?".to_string();
+        let mut where_clause = "is_deleted=0 AND chat_id=?".to_string();
 
         if let Some(d) = date_from {
             where_clause = format!("{} AND dt >= {}", where_clause, d.timestamp())
@@ -277,7 +312,7 @@ mod tests {
     async fn test_new_cost() {
         let db = DB::from_memory().await.unwrap();
         let cat_id = db.create_category(ChatId(0), "t1".to_string(), "test".to_string()).await.unwrap();
-        assert!(db.create_cost(cat_id, 123.41).await.is_ok());
+        assert!(db.create_cost(cat_id, 123.41, None).await.is_ok());
     }
 
     #[tokio::test]
@@ -285,14 +320,14 @@ mod tests {
         let db = DB::from_memory().await.unwrap();
 
         let cat_id = db.create_category(ChatId(0), "t1".to_string(), "test".to_string()).await.unwrap();
-        let _ = db.create_cost(cat_id, 100.0).await.is_ok();
-        let _ = db.create_cost(cat_id, 200.0).await.is_ok();
-        let _ = db.create_cost(cat_id, 300.0).await.is_ok();
+        let _ = db.create_cost(cat_id, 100.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 200.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 300.0, None).await.is_ok();
 
         let cat_id = db.create_category(ChatId(0), "t2".to_string(), "test".to_string()).await.unwrap();
-        let _ = db.create_cost(cat_id, 100.0).await.is_ok();
-        let _ = db.create_cost(cat_id, 200.0).await.is_ok();
-        let _ = db.create_cost(cat_id, 300.0).await.is_ok();
+        let _ = db.create_cost(cat_id, 100.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 200.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 300.0, None).await.is_ok();
         
         let stat = db.get_stat(ChatId(0), None, None).await.unwrap();
         assert_eq!(stat.n_items(), 6);
@@ -305,18 +340,50 @@ mod tests {
         let db = DB::from_memory().await.unwrap();
 
         let cat_id = db.create_category(ChatId(0), "t1".to_string(), "test".to_string()).await.unwrap();
-        let _ = db.create_cost(cat_id, 100.0).await.is_ok();
-        let _ = db.create_cost(cat_id, 200.0).await.is_ok();
-        let _ = db.create_cost(cat_id, 300.0).await.is_ok();
+        let _ = db.create_cost(cat_id, 100.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 200.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 300.0, None).await.is_ok();
 
         let cat_id = db.create_category(ChatId(0), "t2".to_string(), "test".to_string()).await.unwrap();
-        let _ = db.create_cost(cat_id, 100.0).await.is_ok();
-        let _ = db.create_cost(cat_id, 200.0).await.is_ok();
-        let _ = db.create_cost(cat_id, 300.0).await.is_ok();
+        let _ = db.create_cost(cat_id, 100.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 200.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 300.0, None).await.is_ok();
         
         let stat = db.get_stat_this_month(ChatId(0)).await.unwrap();
         assert_eq!(stat.n_items(), 6);
         assert_eq!(stat.amount(), 1200.0);
         assert_eq!(stat.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_stat_float() {
+        let db = DB::from_memory().await.unwrap();
+
+        let cat_id = db.create_category(ChatId(0), "t1".to_string(), "test".to_string()).await.unwrap();
+        let _ = db.create_cost(cat_id, 21.5, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 23.3, None).await.is_ok();
+
+        let stat = db.get_stat_this_month(ChatId(0)).await.unwrap();
+        assert_eq!(stat.n_items(), 2);
+        assert_eq!(stat.amount(), (21.5 + 23.3));
+    }
+
+    #[tokio::test]
+    async fn test_cost_remove() {
+        let db = DB::from_memory().await.unwrap();
+
+        let cat_id = db.create_category(ChatId(0), "t1".to_string(), "test".to_string()).await.unwrap();
+        let _ = db.create_cost(cat_id, 100.0, None).await.is_ok();
+        let _ = db.create_cost(cat_id, 200.0, None).await.is_ok();
+
+        let stat = db.get_stat_this_month(ChatId(0)).await.unwrap();
+        assert_eq!(stat.n_items(), 2);
+        assert!(db.remove_last_cost(ChatId(0)).await.is_ok());
+
+        let stat = db.get_stat_this_month(ChatId(0)).await.unwrap();
+        assert_eq!(stat.n_items(), 1);
+        assert_eq!(stat.amount(), 100.0);
+        assert!(db.remove_last_cost(ChatId(0)).await.unwrap().is_some());
+        assert!(db.remove_last_cost(ChatId(0)).await.unwrap().is_none());
     }
 }

@@ -1,7 +1,7 @@
-use dptree::di;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use teloxide::{
     dispatching::{
-        dialogue::{GetChatId, InMemStorage, InMemStorageError},
+        dialogue::{InMemStorage, InMemStorageError},
         HandlerExt
     }, prelude::*, utils::command::BotCommands
 };
@@ -27,7 +27,9 @@ pub enum State {
         alias: String,
         new_alias: String
     },
-    NewCostReceiveAlias,
+    NewCostReceiveAlias {
+        amount: f64
+    },
     NewCostReceiveAmount {
         id: i64
     }
@@ -57,12 +59,135 @@ enum Command {
     AddCategory,
     #[command(description="Update category", alias="uc")]
     UpdateCategory,
-    #[command(description="Add cost", alias="cost")]
-    AddCost,
-    #[command(description="Stat this month", alias="tm")]
-    StatThisMonth
+    #[command(description="Add cost (alias YYYY-MM-DD XX.XX)", alias="cost", parse_with="split")]
+    AddCost { alias: String, date: String, amount: f64 },
+    #[command(description="Remove last cost", alias="rm")]
+    RemoveLastCost,
+    #[command(description="Stat this month", alias="stm")]
+    StatThisMonth,
+    #[command(description="Overall stat in period (YYYY-MM-DD YYYY-MM-DD)", alias="sp", parse_with="split")]
+    StatPeriod { date_from: String, date_to: String }, 
 }
 
+async fn msg_handler(
+    bot: Bot,
+    dialogue: MyDialogue,
+    msg: Message,
+    db: DB
+) -> Result<(), BotError> {
+    let chat_id = msg.chat.id;
+    if let Some(text) = msg.text() {
+        let mut amount = None;
+        let mut cat_id = None;
+        for piece in text.split_whitespace() {
+            if let Ok(num) = piece.parse::<f64>() {
+                amount = Some(num);
+            }
+            if let Some(cat) = db.get_category_by_alias(chat_id, piece.to_string()).await? {
+                cat_id = Some(cat.id);
+            }
+        }
+        match (amount, cat_id) {
+            (Some(amount), Some(cat_id)) => {
+                db.create_cost(cat_id, amount, None).await?;
+                bot.send_message(chat_id, "Added!").await?;
+            },
+            (None, Some(cat_id)) => {
+                bot.send_message(chat_id, "How much?").await?;
+                dialogue.update(State::NewCostReceiveAmount { id: cat_id }).await?;
+            },
+            (Some(amount), None) => {
+                bot.send_message(chat_id, "Specify category alias").await?;
+                dialogue.update(State::NewCostReceiveAlias { amount }).await?;
+            }
+            _ => { 
+                bot.send_message(chat_id, "/help").await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_add_cost(
+    bot: Bot,
+    db: DB,
+    chat_id: ChatId,
+    alias: String,
+    date: String,
+    amount: f64
+) -> Result<(), BotError> {
+    let cat = match db.get_category_by_alias(chat_id, alias).await? {
+        Some(cat) => cat,
+        None => {
+            bot.send_message(chat_id, "Provide existing category alias").await?;
+            return Ok(());
+        }
+    };
+    let dt = match NaiveDateTime::parse_from_str(
+        &(date.to_string() + " 00:00:00"),
+        "%Y-%m-%d %H:%M:%S"
+    ) {
+        Ok(dt) => DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc),
+        Err(_) => {
+            bot.send_message(chat_id, "Provide date in YYYY-MM-DD format").await?;
+            return Ok(());
+        }
+    };
+    db.create_cost(cat.id, amount, Some(dt)).await?;
+    bot.send_message(chat_id, "Created!").await?;
+    Ok(())
+}
+
+async fn cmd_list_categories(bot: Bot, db: DB, chat_id: ChatId) -> Result<(), BotError> {
+    let cats = db.get_categories(chat_id).await?;
+    let to_sent = match cats.is_empty() {
+        true => "No categories created".to_string(),
+        false => format!(
+            "Categories \n{}",
+            cats.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("\n")
+        )
+    };
+    bot.send_message(chat_id, to_sent).await?;
+    Ok(())
+}
+
+async fn cmd_stat_this_month(bot: Bot, db: DB, chat_id: ChatId) -> Result<(), BotError> {
+    let stat = db.get_stat_this_month(chat_id).await?;
+    bot.send_message(chat_id, stat.to_string()).await?;
+    Ok(())
+}
+
+async fn cmd_stat_period(
+    bot: Bot,
+    db: DB,
+    chat_id: ChatId,
+    date_from: String,
+    date_to: String
+) -> Result<(), BotError> {
+    let df = match NaiveDateTime::parse_from_str(
+        &(date_from + " 00:00:00"),
+        "%Y-%m-%d %H:%M:%S"
+    ) { 
+        Ok(df) => DateTime::<Utc>::from_naive_utc_and_offset(df, Utc),
+        Err(_) => {
+            bot.send_message(chat_id, "Provide date from in YYYY-MM-DD format").await?;
+            return Ok(());
+        }
+    };
+    let dt = match NaiveDateTime::parse_from_str(
+        &(date_to + " 00:00:00"),
+        "%Y-%m-%d %H:%M:%S"
+    ) { 
+        Ok(dt) => DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc),
+        Err(_) => {
+            bot.send_message(chat_id, "Provide date to in YYYY-MM-DD format").await?;
+            return Ok(());
+        }
+    };
+    let stat = db.get_stat(chat_id, Some(df), Some(dt)).await?;
+    bot.send_message(chat_id, stat.to_string()).await?;
+    Ok(())
+}
 
 async fn command_handler(
     bot: Bot,
@@ -74,19 +199,9 @@ async fn command_handler(
     let chat_id = msg.chat.id;
     match cmd {
         Command::Start => {
-            bot.send_message(msg.chat.id, "Hi!").await?;
+            bot.send_message(msg.chat.id, "/help").await?;
         }
-        Command::ListCategory => {
-            let cats = db.get_categories(chat_id).await?;
-            let to_sent = match cats.is_empty() {
-                true => "No categories created".to_string(),
-                false => format!(
-                    "Categories \n{}",
-                    cats.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("\n")
-                )
-            };
-            bot.send_message(chat_id, to_sent).await?;
-        },
+        Command::ListCategory => cmd_list_categories(bot, db, chat_id).await?,
         Command::AddCategory => {
             bot.send_message(chat_id, "Specify category alias").await?;
             dialogue.update(State::NewCategoryReceiveAlias).await?;
@@ -97,21 +212,19 @@ async fn command_handler(
             send_message_with_cats(chat_id, &bot, &cats).await?;
             dialogue.update(State::UpdCategoryReceiveAlias).await?;
         },
-        Command::AddCost => {
-            let cats = db.get_categories(chat_id).await?;
-            bot.send_message(chat_id, "Specify category alias").await?;
-            send_message_with_cats(chat_id, &bot, &cats).await?;
-            dialogue.update(State::NewCostReceiveAlias).await?;
+        Command::AddCost { alias, date, amount } => cmd_add_cost(bot, db, chat_id, alias, date, amount).await?,
+        Command::RemoveLastCost => {
+            match db.remove_last_cost(chat_id).await? {
+                Some(_) => bot.send_message(chat_id, "Removed").await?,
+                None => bot.send_message(chat_id, "Nothing to remove").await?
+            };
         },
-        Command::StatThisMonth => {
-            let stat = db.get_stat_this_month(chat_id).await?;
-            bot.send_message(chat_id, stat.to_string()).await?;
-        },
+        Command::StatThisMonth => cmd_stat_this_month(bot, db, chat_id).await?,
+        Command::StatPeriod { date_from, date_to } => cmd_stat_period(bot, db, chat_id, date_from, date_to).await?,
         Command::Help => {
             bot.send_message(msg.chat.id, Command::descriptions().to_string()).await?;
         },
     }
-    bot.delete_message(chat_id, msg.id).await?;
     Ok(())
 }
 
@@ -127,7 +240,6 @@ async fn new_category_get_alias(
             match db.get_category_by_alias(chat_id, alias.to_string()).await? {
                 None => {
                     bot.send_message(chat_id, "Give full name").await?;
-                    bot.delete_message(chat_id, msg.id).await?;
                     dialogue.update(State::NewCategoryReceiveName {
                         alias: alias.to_string()
                     }).await?
@@ -159,7 +271,6 @@ async fn new_category_get_name(
             let report = format!("Category saved \n\t Alias={alias} \n\t Name={name}");
             db.create_category(chat_id, alias, name).await?;
             bot.send_message(chat_id, report).await?;
-            bot.delete_message(chat_id, msg.id).await?;
             dialogue.exit().await?;
         },
         None => {
@@ -174,7 +285,6 @@ async fn send_message_with_cats(
     bot: &Bot,
     cats: &[CategoryRow]
 ) -> Result<(), BotError> {
-    bot.send_message(chat_id, "List of categories available").await?;
     bot.send_message(chat_id, format!(
         "Categories \n{}",
         cats.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("\n")
@@ -205,7 +315,6 @@ async fn upd_category_start(
             send_message_with_cats(chat_id, &bot, &cats).await?;
         }
     };
-    bot.delete_message(chat_id, msg.id).await?;
     Ok(())
 }
 
@@ -226,7 +335,6 @@ async fn upd_category_alias(
             bot.send_message(chat_id, "Provide alias name").await?;
         }
     };
-    bot.delete_message(chat_id, msg.id).await?;
     Ok(())
 }
 
@@ -249,13 +357,13 @@ async fn upd_category_name(
             bot.send_message(chat_id, "Provide a name").await?;
         }
     };
-    bot.delete_message(chat_id, msg.id).await?;
     Ok(())
 }
 
 async fn new_cost_get_alias(
     bot: Bot,
     dialogue: MyDialogue,
+    amount: f64,
     msg: Message,
     db: DB
 ) -> Result<(), BotError> {
@@ -265,19 +373,17 @@ async fn new_cost_get_alias(
         let alias = alias.to_string();
         match cats.iter().filter(|i| i.category.alias == alias).collect::<Vec<_>>().first() {
             Some(cat) => {
-                bot.send_message(chat_id, "Specify amount").await?;
-                dialogue.update(State::NewCostReceiveAmount { id: cat.id }).await?;
+                db.create_cost(cat.id, amount, None).await?;
+                bot.send_message(chat_id, "Saved").await?;
+                dialogue.exit().await?;
             },
             None => {
-                bot.send_message(chat_id, "Specify category alias").await?;
                 send_message_with_cats(chat_id, &bot, &cats).await?;
             }
         };
     } else {
-        bot.send_message(chat_id, "Specify category alias") .await?;
         send_message_with_cats(chat_id, &bot, &cats).await?;
     }
-    bot.delete_message(chat_id, msg.id).await?;
     Ok(())
 }
 
@@ -292,7 +398,7 @@ async fn new_cost_get_amount(
     if let Some(amount_str) = msg.text() {
         match amount_str.parse::<f64>() {
             Ok(amount) => {
-                db.create_cost(id, amount).await?;
+                db.create_cost(id, amount, None).await?;
                 bot.send_message(chat_id, "Created!").await?;
                 dialogue.exit().await?;
             },
@@ -301,7 +407,6 @@ async fn new_cost_get_amount(
             }
         };
     }
-    bot.delete_message(chat_id, msg.id).await?;
     Ok(())
 }
 
@@ -320,8 +425,9 @@ pub async fn run_bot(db: DB) -> Result<(), BotError> {
         .branch(dptree::case![State::UpdCategoryReceiveAlias].endpoint(upd_category_start))
         .branch(dptree::case![State::UpdCategoryReceiveNewAlias { alias }].endpoint(upd_category_alias))
         .branch(dptree::case![State::UpdCategoryReceiveNewName { alias, new_alias }].endpoint(upd_category_name))
-        .branch(dptree::case![State::NewCostReceiveAlias].endpoint(new_cost_get_alias))
-        .branch(dptree::case![State::NewCostReceiveAmount { id }].endpoint(new_cost_get_amount));
+        .branch(dptree::case![State::NewCostReceiveAlias { amount } ].endpoint(new_cost_get_alias))
+        .branch(dptree::case![State::NewCostReceiveAmount { id }].endpoint(new_cost_get_amount))
+        .branch(Update::filter_message().endpoint(msg_handler));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![storage, db.clone()])

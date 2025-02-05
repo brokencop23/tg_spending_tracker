@@ -10,5 +10,6 @@ CREATE TABLE IF NOT EXISTS spendings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     dt INTEGER,
     category_id INTEGER,
+    is_deleted INTEGER DEFAULT 0,
     amount_cent INTEGER
 );
