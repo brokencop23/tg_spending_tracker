@@ -1,0 +1,5 @@
+services:
+  bot:
+    image: brokencop23/tg-spending-bot
+    environment:
+      - TELOXIDE_TOKEN=${TELOXIDE_TOKEN}
