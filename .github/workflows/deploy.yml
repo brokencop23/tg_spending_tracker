@@ -69,8 +69,8 @@ jobs:
         host: ${{ vars.DROPLET_IP }}
         username: ${{ secrets.DROPLET_USERNAME }}
         key: ${{ secrets.DROPLET_KEY }}
-        source: "docker-compose.yml"
-        target: "/root/"
+        source: "./docker-compose.yaml"
+        target: "~"
 
     - name: Deploy
       uses: appleboy/ssh-action@master
