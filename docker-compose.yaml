@@ -3,3 +3,5 @@ services:
     image: brokencop23/tg-spending-bot
     environment:
       - TELOXIDE_TOKEN=${TELOXIDE_TOKEN}
+    volumes:
+      - ./data:/app/data
