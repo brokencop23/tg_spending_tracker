@@ -1,6 +1,3 @@
-# tg_spending_tracker
+# Telegram Spending Tracker
 
-- TG Commands
--- /newcat /nc alias name
--- /add cat_alias amount
--- /stat 
+Pet project for Telegram bot that can keep track on spendings.
