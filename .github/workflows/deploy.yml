@@ -42,13 +42,13 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and push Docker images
-        uses: docker/bake-action@v2.3.0
+        uses: docker/build-push-action@v4
         with:
+          context: .
           push: true
-          set: |
-            *.cache-from=type=gha
-            *.cache-to=type=gha,mode=max
-
+          tags: brokencop23/tg-spending-bot:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   deploy:
     needs: build
